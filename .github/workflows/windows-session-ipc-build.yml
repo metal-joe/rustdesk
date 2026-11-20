@@ -1,0 +1,209 @@
+# Windows x64 build of RustDesk 1.5.3 with session-scoped IPC pipes.
+#
+# Builds the branch "session-scoped-ipc" (tag 1.5.3 + commit
+# "Windows: use one IPC pipe per session for portable copies").
+#
+# Output: one self-extracting rustdesk-<version>-session-ipc-x64.exe, built and
+# packed like the official rustdesk-<version>-x86_64.exe:
+#   - installed (--silent-install): behaves exactly like the original
+#   - portable on a multi-session host: every session gets its own IPC pipe
+#
+# Build command, packing and tool versions follow RustDesk's own CI for
+# Windows x64 at tag 1.5.3 (.github/workflows/flutter-build.yml), without code
+# signing and without the optional "RustDeskTempTopMostWindow" helper.
+#
+# All third-party actions are pinned by commit hash. The only token is the
+# automatic GITHUB_TOKEN, used for the release in this fork.
+
+name: Windows build (session-scoped IPC)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - session-scoped-ipc
+
+env:
+  RUST_VERSION: "1.75"
+  LLVM_VERSION: "15.0.6"
+  FLUTTER_VERSION: "3.24.5"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+  VCPKG_COMMIT_ID: "9e593bb18ea69cc5095e012465dcd675a822ed0d"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-windows:
+    name: build windows x64 (session-scoped IPC)
+    needs: [generate-bridge]
+    runs-on: windows-2022
+    permissions:
+      contents: write        # release in this fork only
+    steps:
+      - name: Export GitHub Actions cache environment variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          submodules: recursive
+
+      - name: Verify session-scoped IPC patch is present
+        shell: bash
+        run: |
+          # Without the patch the EXE would again serve only one session per host.
+          grep -q "fn session_scoped_ipc_path" src/ipc.rs || { echo "patch missing in src/ipc.rs"; exit 1; }
+          grep -q "ipc_windows::connect(&session_scoped_ipc_path(postfix), postfix)" src/ipc.rs \
+            || { echo "Windows branch of connect() not patched"; exit 1; }
+          echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+          echo "Patch present."
+
+      - name: Restore bridge files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: bridge-artifact
+          path: ./
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2.0.9
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225 # v2.12.0
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+
+      - name: Replace engine with rustdesk custom flutter engine
+        run: |
+          flutter doctor -v
+          flutter precache --windows
+          Invoke-WebRequest -Uri https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip -OutFile windows-x64-release.zip
+          Expand-Archive -Path windows-x64-release.zip -DestinationPath windows-x64-release
+          mv -Force windows-x64-release/*  C:/hostedtoolcache/windows/flutter/stable-${{ env.FLUTTER_VERSION }}-x64/bin/cache/artifacts/engine/windows-x64-release/
+
+      - name: Patch flutter
+        shell: bash
+        run: |
+          cp .github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff $(dirname $(dirname $(which flutter)))
+          cd $(dirname $(dirname $(which flutter)))
+          git apply flutter_3.24.4_dropdown_menu_enableFilter.diff
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: x86_64-pc-windows-msvc
+          components: "rustfmt"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          prefix-key: windows-2022-session-ipc
+
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Install vcpkg dependencies
+        env:
+          VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+        shell: bash
+        run: |
+          if ! $VCPKG_ROOT/vcpkg \
+            install \
+            --triplet x64-windows-static \
+            --x-install-root="$VCPKG_ROOT/installed"; then
+            find "${VCPKG_ROOT}/" -name "*.log" | while read -r _1; do
+              echo "$_1:"
+              echo "======"
+              cat "$_1"
+              echo "======"
+              echo ""
+            done
+            exit 1
+          fi
+
+      - name: Build rustdesk
+        run: |
+          python3 .\build.py --portable --flutter --skip-portable-pack --hwcodec --vram
+          mv ./flutter/build/windows/x64/runner/Release ./rustdesk
+
+      - name: Verify Windows Flutter version
+        shell: powershell
+        run: |
+          $reportedVersion = (& ".\rustdesk\rustdesk.exe" --version | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw "rustdesk --version exited with $LASTEXITCODE" }
+          if ($reportedVersion -cne $env:VERSION) { throw "RustDesk reports '$reportedVersion', expected '$env:VERSION'" }
+          "rustdesk.exe reports version $reportedVersion"
+
+      - name: Build self-extracted executable
+        shell: bash
+        run: |
+          # Same as "Build self-extracted executable" in RustDesk's own CI
+          sed -i '/dpiAware/d' res/manifest.xml
+          pushd ./libs/portable
+          pip3 install -r requirements.txt
+          python3 ./generate.py -f ../../rustdesk/ -o . -e ../../rustdesk/rustdesk.exe
+          popd
+          mkdir -p ./SignOutput
+          mv ./target/release/rustdesk-portable-packer.exe "./SignOutput/rustdesk-${VERSION}-session-ipc-x64.exe"
+
+      - name: Smoke test of the self-extracting EXE
+        shell: powershell
+        run: |
+          # The self-extracting EXE must unpack itself and report the right version.
+          $exe = Get-ChildItem ./SignOutput/*.exe | Select-Object -First 1
+          $p = Start-Process -FilePath $exe.FullName -ArgumentList '--version' -Wait -PassThru
+          $extracted = Join-Path $env:LOCALAPPDATA 'rustdesk\rustdesk.exe'
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $extracted); $i++) { Start-Sleep -Seconds 1 }
+          if (-not (Test-Path $extracted)) { throw "extraction failed: $extracted missing" }
+          $v = (& $extracted --version | Out-String).Trim()
+          if ($v -cne $env:VERSION) { throw "extracted EXE reports '$v', expected '$env:VERSION'" }
+          "Self-extracting EXE ok, unpacked to $extracted, version $v"
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd SignOutput
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustdesk-${{ env.VERSION }}-session-ipc-x64
+          path: SignOutput
+          retention-days: 30
+
+      - name: Publish pre-release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A tag that matches no version pattern, so RustDesk's own tag
+          # workflows do not start. Releases made with GITHUB_TOKEN trigger no
+          # further workflows anyway.
+          TAG="session-ipc-${VERSION}-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" SignOutput/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "RustDesk ${VERSION} with session-scoped IPC (#${GITHUB_RUN_NUMBER}) - unsigned" \
+            --notes "Unofficial build, NOT an official RustDesk release.
+
+          RustDesk ${VERSION} plus 'Windows: use one IPC pipe per session for portable copies'.
+          Installed, the EXE behaves like the original; run portable on a
+          multi-session host, every session gets its own IPC pipe.
+
+          Source: this fork, branch session-scoped-ipc, commit ${GITHUB_SHA}.
+          Not code-signed."
