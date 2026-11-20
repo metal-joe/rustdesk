@@ -1,7 +1,8 @@
 # Windows x64 build of RustDesk 1.5.3 with session-scoped IPC pipes.
 #
-# Builds the branch "session-scoped-ipc" (tag 1.5.3 + commit
-# "Windows: use one IPC pipe per session for portable copies").
+# Builds the branch "session-scoped-ipc": tag 1.5.3 plus
+#   - "Windows: use one IPC pipe per session for portable copies"
+#   - "Desktop: honour a local hide-help-cards option"
 #
 # Output: one self-extracting rustdesk-<version>-session-ipc-x64.exe, built and
 # packed like the official rustdesk-<version>-x86_64.exe:
@@ -60,6 +61,8 @@ jobs:
           grep -q "fn session_scoped_ipc_path" src/ipc.rs || { echo "patch missing in src/ipc.rs"; exit 1; }
           grep -q "ipc_windows::connect(&session_scoped_ipc_path(postfix), postfix)" src/ipc.rs \
             || { echo "Windows branch of connect() not patched"; exit 1; }
+          grep -q "bind.mainGetOptionSync(key: kOptionHideHelpCards)" flutter/lib/desktop/pages/desktop_home_page.dart \
+            || { echo "local hide-help-cards option not patched"; exit 1; }
           echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
           echo "Patch present."
 
@@ -201,7 +204,8 @@ jobs:
             --title "RustDesk ${VERSION} with session-scoped IPC (#${GITHUB_RUN_NUMBER}) - unsigned" \
             --notes "Unofficial build, NOT an official RustDesk release.
 
-          RustDesk ${VERSION} plus 'Windows: use one IPC pipe per session for portable copies'.
+          RustDesk ${VERSION} plus 'Windows: use one IPC pipe per session for portable copies'
+          and 'Desktop: honour a local hide-help-cards option'.
           Installed, the EXE behaves like the original; run portable on a
           multi-session host, every session gets its own IPC pipe.
 
