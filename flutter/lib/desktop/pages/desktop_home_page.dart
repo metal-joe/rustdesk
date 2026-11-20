@@ -582,7 +582,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       String? link,
       bool? closeButton,
       String? closeOption}) {
-    if (bind.mainGetBuildinOption(key: kOptionHideHelpCards) == 'Y' &&
+    // Also honour the option in the local config, so a deployment can hide
+    // the "Install" card on hosts where the portable copy must stay portable.
+    if ((bind.mainGetBuildinOption(key: kOptionHideHelpCards) == 'Y' ||
+            bind.mainGetOptionSync(key: kOptionHideHelpCards) == 'Y') &&
         content != 'install_daemon_tip') {
       return const SizedBox();
     }
