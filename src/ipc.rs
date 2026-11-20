@@ -704,8 +704,44 @@ pub(crate) async fn start_with_listener(postfix: &str, mut incoming: Incoming) {
     }
 }
 
+// A portable copy that runs in several Windows sessions at once (terminal server, RDP Wrapper)
+// must not share one pipe. With a shared name the second session either connects to the first
+// session's server and adopts its config, ID included, or - since the IPC hardening - is rejected
+// with "IPC server is not owned by the expected identity". Either way only one session works.
+//
+// Portable copies therefore add the session id to the pipe name. The installed copy keeps the
+// shared name because its service talks across sessions, and the service pipes always stay
+// machine-wide: they address the one SYSTEM service of the machine by definition.
+#[cfg(windows)]
+fn session_scoped_ipc_path(postfix: &str) -> String {
+    static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if hbb_common::config::is_service_ipc_postfix(postfix) {
+        return Config::ipc_path(postfix);
+    }
+    let suffix = SUFFIX.get_or_init(|| {
+        if crate::platform::is_cur_exe_the_installed() {
+            return String::new();
+        }
+        crate::platform::windows::get_current_process_session_id()
+            .map(|sid| format!("_s{sid}"))
+            .unwrap_or_default()
+    });
+    if suffix.is_empty() {
+        return Config::ipc_path(postfix);
+    }
+    format!(
+        "\\\\.\\pipe\\{}{}\\query{}",
+        crate::common::get_app_name(),
+        suffix,
+        postfix
+    )
+}
+
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
+    #[cfg(not(windows))]
     let path = Config::ipc_path(postfix);
+    #[cfg(windows)]
+    let path = session_scoped_ipc_path(postfix);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let should_scrub_parent_entries = ensure_secure_ipc_parent_dir(&path, postfix)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1547,7 +1583,7 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
         return Ok(ConnectionTmpl::new(
             timeout(
                 ms_timeout,
-                ipc_windows::connect(&Config::ipc_path(postfix), postfix),
+                ipc_windows::connect(&session_scoped_ipc_path(postfix), postfix),
             )
             .await??,
         ));
@@ -1567,7 +1603,10 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        #[cfg(not(windows))]
         let path = Config::ipc_path(postfix);
+        #[cfg(windows)]
+        let path = session_scoped_ipc_path(postfix);
         connect_with_path(ms_timeout, &path).await
     }
 }
